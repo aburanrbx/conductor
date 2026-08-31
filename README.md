@@ -20,6 +20,22 @@ what is actually built.
 
 ## What it does
 
+The default project is `cooperative`: a collision is a warning that names the holder and the
+obligation — request the territory (level 2 of the enforcement ladder below).
+
+```
+$ conductor check --summary "add retry-aware model routing" --scope dir:internal/router
+
+Proceed with care: scope conflict on dir:internal/router
+
+  alice holds dir:internal/router for T-1 (write_exclusive).
+  Request the territory with coord_expand_scope (or `conductor scope add`) before you
+  build on it, or wait, split your scope, or join their task.
+```
+
+A `strict_harness` project (set `claimMode: strict_harness` in `project.yaml`) answers the
+same question the hard way:
+
 ```
 $ conductor check --summary "add retry-aware model routing" --scope dir:internal/router
 
@@ -229,19 +245,35 @@ the parse boundary before it can reach the store. Three tests assert this mechan
 Requires Go 1.25+, Docker (for Postgres), and git.
 
 ```bash
-make db-up                                  # Postgres on :55432
-make build                                  # bin/conductord, bin/conductor, bin/conductor-mcp
+make up
+```
+
+That is the whole thing: Postgres on `:55432`, the binaries in `bin/`, the control plane
+(API, SSE, dashboard, scheduler) serving `127.0.0.1:8080` in the background — log and
+pidfile under `.conductor/runtime/` — and your CLI login saved at `~/.conductor/credentials`.
+No token to copy, no second terminal.
+
+```bash
+conductor status                             # what is in flight
+conductor dashboard                          # prints a ready-to-open link
+make down                                    # stop the control plane (make db-down also stops Postgres)
+```
+
+### Manual, or on another repository
+
+```bash
+make db-up && make build                     # Postgres + bin/conductord, bin/conductor, bin/conductor-mcp
 
 cd /path/to/your/repo
-conductor init                              # scaffold .conductor/ policy files
+conductor init                               # scaffold .conductor/ policy files
 
 export DATABASE_URL="postgres://conductor:conductor@localhost:55432/conductor?sslmode=disable"
 conductord bootstrap --org acme --project myrepo --principal $USER --repo .
-# prints a token and the exact `conductor login` line to run
+# saves your login at ~/.conductor/credentials — no copy-paste
+# (--no-login skips that; --endpoint saves a different URL than http://localhost:8080)
 
-conductord &                                # API, SSE, dashboard, scheduler on 127.0.0.1:8080
-conductor login --endpoint http://localhost:8080 --token cdt_… --project myrepo
-conductor dashboard                         # prints a ready-to-open link
+conductord &                                 # or: make serve, same thing in the foreground
+conductor dashboard                          # prints a ready-to-open link
 ```
 
 ### Adding your coworkers
@@ -326,6 +358,8 @@ make e2e
 conductor check --summary "…" --scope dir:internal/api    # before you edit. exit 3 = stop
 conductor task claim --next                               # take work and its territory
 conductor wrap claude                                     # register a session + heartbeat, then launch
+conductor serve qwen                                      # local vLLM for OpenCode (also: flash, glm53)
+conductor wrap opencode --model vllm/qwen3.8-27b
 conductor presence --watch                                # who is live, on what
 conductor conflicts                                       # what is contested and what to do
 conductor task handoff T-42 --to codex --next "write tests"
@@ -401,9 +435,10 @@ Eleven tools: `conductor_check_conflicts`, `coord_start_work`, `coord_get_work`,
 `coord_handoff`, `coord_delegate`, `coord_capabilities`, `coord_project_status`. Heartbeats are
 deliberately *not* an MCP tool — a model should never spend tokens telling the server it is
 still alive. And where a harness supports pre-edit hooks, `conductor integrate` installs
-`conductor hook pre-tool`, which calls the same conflict check before every edit and blocks the
-tool call (exit 2, with the holder named) when someone else holds the file — enforcement, not
-just advice.
+`conductor hook pre-tool`, which calls the same conflict check before every edit and follows
+the project's enforcement level: `strict_harness` blocks the tool call (exit 2, with the
+holder named), `cooperative` lets it through with the expansion instruction, `advisory`
+warns — enforcement, not just advice.
 
 ### Token usage across harnesses
 
@@ -532,9 +567,14 @@ non-destructive:
    how to reopen a session, never a transcript. `CONDUCTOR_BACKUP=off` disables it.
 
 Wrapped sessions stay honest with the team while paused: the sidecar keeps heartbeating as
-`waiting_for_input`, so presence shows a parked session that is not offered work, rather than
-a mystery that stopped moving. A relaunched wrap registers a fresh session with the same
+`paused`, so presence shows a parked session that is not offered work, rather than a mystery
+that stopped moving. A relaunched wrap registers a fresh session with the same
 capability flags it was started with.
+
+The dashboard's Pause and Resume buttons reach a wrapped session through the same channel:
+the request rides the session's next heartbeat, the sidecar freezes or wakes its harness
+exactly as `conductor pause` would, and its acknowledgement clears the request — so a
+teammate can park an agent without a terminal on its machine.
 
 **VS Code:** integrated terminals are ordinary ptys, so pausing and in-place resume already
 work there. Reopening a *closed* session into VS Code needs the companion extension in
@@ -620,6 +660,10 @@ Implemented and exercised by tests:
 - Isolated git worktrees, scope-drift detection, runner-attested validation, evidence manifests,
   handoff bundles, portable Markdown task cards.
 - Member and token administration, TLS, a loopback-by-default bind, and auth throttling.
+- Daemon-to-daemon peering over mutual TLS: a private CA names every control plane in a
+  mesh, each daemon dials its configured peers and keeps a live link table, and
+  `conductor peers` reports it. Connectivity and identity only — no data is replicated
+  across the link.
 - A runner that reaches the control plane over HTTP and holds no database credential
   (§28.2), alongside the in-process backend for single-host use (§28.1).
 - One-link onboarding: `conductor invite <handle>` mints a teammate their own token and prints
@@ -650,9 +694,9 @@ Not built, and where the design says it goes:
 - **OIDC** (§25.1). Authentication is bearer tokens hashed at rest; there is no identity
   provider integration.
 - **Merge queue, PR integration, tracker sync, symbol/tree-sitter indexing** (§29, §30 phase 5).
-- **Codex and OpenCode model ids** are declared but disabled in `.conductor/models.yaml`. The
-  design forbids hardcoding provider model names that have not been verified, so an operator
-  fills those in.
+- **Codex model ids** are still empty in `.conductor/models.yaml` until an operator names a
+  verified Codex model. **OpenCode** is wired to local vLLM: Qwen 3.8 27B, GLM-5.3-Flash, and
+  GLM-5.3 (`conductor serve qwen|flash|glm53`, then `conductor wrap opencode --model vllm/…`).
 
 One deliberate deviation from the design document: it recommends TypeScript (§28.1). This is
 Go, at the repository owner's direction. The tradeoff is real — the Claude Agent SDK and
@@ -702,6 +746,48 @@ The suite proves the invariants rather than asserting them in prose. Notably:
 | `TestSimilarityIsStableAcrossKeys` | duplicate detection does not miss real collisions across tenant keys |
 | `TestMCPWorkLifecycleAgainstLiveServer` | the MCP gateway works against the real API, not a stub |
 | `TestQueuedAttemptCannotSucceed` | an attempt cannot report success without having run |
+| `TestProbeUntrustedPeer` | a daemon certified by another CA can never pass as a peer |
+| `TestPeerInfoRequiresMeshCertificate` | a bearer token is not a peer credential; only a mesh certificate is |
+
+---
+
+## Peering daemons
+
+A mesh is a set of `conductord` instances that know each other by certificate. One CA is
+generated per mesh; every daemon holds a certificate signed by it and uses that single
+certificate in two roles — served as its TLS certificate, and presented as its client
+certificate when dialing peers. A peer link is therefore mutual TLS: each side proves it
+holds a mesh-issued key, and the mesh CA is the only root either side trusts for it.
+
+Peering carries connectivity and identity, nothing else. Each daemon probes its
+configured peers (`GET /v1/peer/info`) and records state, round-trip time, and the
+identity that answered; project members read that link table with `conductor peers`. No
+tasks, scopes, or events cross the link — the database remains each daemon's own source
+of truth.
+
+```bash
+# once per mesh: a CA, then one certificate per daemon
+scripts/gen-peer-certs.sh laptop desktop
+
+# per daemon (each points at the other)
+conductord --addr 0.0.0.0:8443 \
+  --peer-ca .conductor/certs/ca.pem \
+  --peer-cert .conductor/certs/laptop/cert.pem --peer-key .conductor/certs/laptop/key.pem \
+  --peer desktop=https://desktop.example.com:8443
+
+conductord --addr 0.0.0.0:8443 \
+  --peer-ca .conductor/certs/ca.pem \
+  --peer-cert .conductor/certs/desktop/cert.pem --peer-key .conductor/certs/desktop/key.pem \
+  --peer laptop=https://laptop.example.com:8443
+
+conductor peers   # PEER ADDRESS STATE RTT LAST CHECK
+```
+
+Env equivalents: `CONDUCTOR_PEERS=name=url,…` (comma-separated) plus
+`CONDUCTOR_PEER_CA`, `CONDUCTOR_PEER_CERT`, `CONDUCTOR_PEER_KEY`. Clients verify the
+daemon with `CONDUCTOR_CA_CERT=.conductor/certs/ca.pem`. Peer URLs must be `https` —
+a plaintext peer would put the mesh identity on an unauthenticated wire, and the daemon
+refuses it.
 
 ---
 

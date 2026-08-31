@@ -5,9 +5,11 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"os/signal"
+	"path/filepath"
 	"sort"
 	"strings"
 	"sync/atomic"
@@ -841,10 +843,16 @@ func cmdWrap(ctx context.Context, args []string) error {
 	// reclaimed while the session runs; a closed session releases it (`admission` below).
 	admission := admitSession(ctx, api, ref, session.ID, tool, caps.Model)
 
-	// paused is flipped by SIGUSR1/SIGUSR2 from `conductor pause` and `conductor resume`.
-	// While paused this sidecar keeps heartbeating as waiting_for_input: the session is
-	// present but must not be offered work, and presence should say why nothing is moving.
+	// paused is flipped by SIGUSR1/SIGUSR2 from `conductor pause` and `conductor resume`,
+	// and by a control the dashboard records for this session. While paused this sidecar
+	// keeps heartbeating as `paused`: the session is present but frozen, must not be
+	// offered work, and presence should say why nothing is moving.
 	var paused atomic.Bool
+	// controlCh carries a dashboard-requested pause or resume from the heartbeat loop —
+	// which runs before the child exists — to the signal goroutine that owns the child's
+	// signals. Buffered and lossy on purpose: a dropped control stays pending on the
+	// server, so the next heartbeat offers it again.
+	controlCh := make(chan domain.SessionControl, 1)
 
 	heartbeatCtx, stopHeartbeat := context.WithCancel(ctx)
 	defer stopHeartbeat()
@@ -858,11 +866,25 @@ func cmdWrap(ctx context.Context, args []string) error {
 			case <-ticker.C:
 				state := domain.SessionWorking
 				if paused.Load() {
-					state = domain.SessionWaitingForInput
+					state = domain.SessionPaused
 				}
 				b, _ := gitOutput(heartbeatCtx, "rev-parse", "--abbrev-ref", "HEAD")
-				_ = api.Post(heartbeatCtx, "/v1/sessions/"+session.ID+"/heartbeat",
-					map[string]any{"state": string(state), "branch": b}, nil)
+				// The response is not discarded: it carries any control the dashboard
+				// has recorded for this session, which this sidecar is the only party
+				// able to carry out.
+				var resp domain.Session
+				if err := api.Post(heartbeatCtx, "/v1/sessions/"+session.ID+"/heartbeat",
+					map[string]any{
+						"state": string(state), "branch": b,
+						"control_ack": string(controlAck(paused.Load())),
+					}, &resp); err == nil {
+					if act := controlAction(resp.PendingControl, paused.Load()); act != "" {
+						select {
+						case controlCh <- act:
+						default: // still applying an earlier control; it will be offered again
+						}
+					}
+				}
 				admission.heartbeat(heartbeatCtx)
 			}
 		}
@@ -888,6 +910,18 @@ func cmdWrap(ctx context.Context, args []string) error {
 		"CONDUCTOR_SESSION_ID="+session.ID,
 		"CONDUCTOR_PROJECT="+ref,
 	)
+
+	// Harness log tee: mirror the harness's combined output into the localstate
+	// sessions directory so the dashboard can stream it (GET /v1/sessions/{id}/logs).
+	// Headless wraps (piped stdout, the way scripts and the runner drive wrap) always
+	// tee; an interactive wrap opts in with CONDUCTOR_HARNESS_LOG=1 — teeing there
+	// hands the child a pipe instead of the terminal, which would downgrade the
+	// interactive harness's rendering, so the default for terminals is no capture.
+	if capture, _ := harnessLogTee(session.ID); capture != nil {
+		defer capture.Close()
+		cmd.Stdout = io.MultiWriter(os.Stdout, capture)
+		cmd.Stderr = io.MultiWriter(os.Stderr, capture)
+	}
 
 	// Token usage. The harness writes its own usage log as it runs; this sidecar reads that
 	// log — numbers, model, timestamp, nothing else — and reports hourly buckets, so the
@@ -928,8 +962,23 @@ func cmdWrap(ctx context.Context, args []string) error {
 
 	// SIGUSR1 pauses: SIGSTOP to the child only, so this sidecar keeps running and the shell
 	// never reclaims the terminal — which is what lets SIGCONT later hand the keyboard
-	// straight back. SIGUSR2 wakes. Both report the state change immediately rather than
-	// waiting for the next tick.
+	// straight back. SIGUSR2 wakes. A control the dashboard recorded arrives on controlCh
+	// and does the same thing. Both report the state change immediately rather than
+	// waiting for the next tick, and the report's control_ack clears the request.
+	apply := func(pause bool) {
+		sig := syscall.SIGCONT
+		if pause {
+			sig = syscall.SIGSTOP
+		}
+		_ = syscall.Kill(cmd.Process.Pid, sig)
+		paused.Store(pause)
+		state := domain.SessionWorking
+		if pause {
+			state = domain.SessionPaused
+		}
+		_ = api.Post(heartbeatCtx, "/v1/sessions/"+session.ID+"/heartbeat",
+			map[string]any{"state": string(state), "control_ack": string(controlAck(pause))}, nil)
+	}
 	sigCh := make(chan os.Signal, 4)
 	signal.Notify(sigCh, syscall.SIGUSR1, syscall.SIGUSR2)
 	defer signal.Stop(sigCh)
@@ -939,17 +988,9 @@ func cmdWrap(ctx context.Context, args []string) error {
 			case <-heartbeatCtx.Done():
 				return
 			case sig := <-sigCh:
-				state := domain.SessionWorking
-				if sig == syscall.SIGUSR1 {
-					_ = syscall.Kill(cmd.Process.Pid, syscall.SIGSTOP)
-					paused.Store(true)
-					state = domain.SessionWaitingForInput
-				} else {
-					_ = syscall.Kill(cmd.Process.Pid, syscall.SIGCONT)
-					paused.Store(false)
-				}
-				_ = api.Post(heartbeatCtx, "/v1/sessions/"+session.ID+"/heartbeat",
-					map[string]any{"state": string(state)}, nil)
+				apply(sig == syscall.SIGUSR1)
+			case act := <-controlCh:
+				apply(act == domain.ControlPause)
 			}
 		}
 	}()
@@ -1086,4 +1127,31 @@ func killedBySignal(runErr error) bool {
 	}
 	ws, ok := exitErr.Sys().(syscall.WaitStatus)
 	return ok && ws.Signaled()
+}
+
+// harnessLogTee opens the session's harness log for appending and reports whether the
+// wrap should capture: always when stdout is not a terminal (headless), and for a
+// terminal only when CONDUCTOR_HARNESS_LOG=1 opts in — capture replaces the child's
+// stdio with pipes, which an interactive harness would notice.
+func harnessLogTee(sessionID string) (*os.File, string) {
+	if v := strings.TrimSpace(os.Getenv("CONDUCTOR_HARNESS_LOG")); v != "1" {
+		if fi, err := os.Stdout.Stat(); err != nil || fi.Mode()&os.ModeCharDevice == 0 {
+			// Headless: fall through to capture below.
+		} else {
+			return nil, ""
+		}
+	}
+	dir, err := localstate.Dir()
+	if err != nil {
+		return nil, ""
+	}
+	path := filepath.Join(dir, sessionID, "harness.log")
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return nil, ""
+	}
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
+	if err != nil {
+		return nil, ""
+	}
+	return f, path
 }

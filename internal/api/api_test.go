@@ -285,6 +285,14 @@ func TestEventStreamCarriesNoPromptFields(t *testing.T) {
 func TestScopeConflictIsA409WithTheHolder(t *testing.T) {
 	h := newHarness(t)
 
+	// A blocking answer is the strict_harness contract (DESIGN.md §11.5 level 3);
+	// cooperative projects warn instead (see the companion test below).
+	cfg := domain.DefaultProjectConfig()
+	cfg.ClaimMode = domain.EnforceStrictHarness
+	if err := h.store.UpdateProjectConfig(context.Background(), h.project.ID, cfg); err != nil {
+		t.Fatalf("strict config: %v", err)
+	}
+
 	code, body := h.do(h.aliceTok, http.MethodPost, h.projectPath("/work/start"), map[string]any{
 		"summary": "rework the router",
 		"scopes":  []map[string]any{{"resource": "dir:internal/router", "mode": "write_exclusive"}},
@@ -316,6 +324,45 @@ func TestScopeConflictIsA409WithTheHolder(t *testing.T) {
 	}
 	if decision.Advice == "" {
 		t.Error("a blocked check should say what to do about it")
+	}
+}
+
+// The same collision in the default cooperative project is a warning that names the holder
+// and the obligation — request the territory (DESIGN.md §11.5 level 2).
+func TestScopeConflictCooperativeWarnsWithExpansionAdvice(t *testing.T) {
+	h := newHarness(t) // default project config: cooperative
+
+	code, body := h.do(h.aliceTok, http.MethodPost, h.projectPath("/work/start"), map[string]any{
+		"summary": "rework the router",
+		"scopes":  []map[string]any{{"resource": "dir:internal/router", "mode": "write_exclusive"}},
+	})
+	if code != http.StatusOK {
+		t.Fatalf("alice start = %d\n%s", code, body)
+	}
+
+	code, body = h.do(h.bobTok, http.MethodPost, h.projectPath("/intents/check"), map[string]any{
+		"summary": "touch the router too",
+		"scopes":  []map[string]any{{"resource": "path:internal/router/policy.go", "mode": "write_exclusive"}},
+	})
+	if code != http.StatusOK {
+		t.Fatalf("check = %d\n%s", code, body)
+	}
+
+	var decision coord.IntentDecision
+	if err := json.Unmarshal(body, &decision); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if decision.Outcome != domain.OutcomeAllowWithWarning {
+		t.Errorf("outcome = %s, want allow_with_warning", decision.Outcome)
+	}
+	if !strings.Contains(decision.Advice, "coord_expand_scope") {
+		t.Errorf("advice should demand expansion: %q", decision.Advice)
+	}
+	if len(decision.Conflicts) == 0 || decision.Conflicts[0].HolderOwner != "alice" {
+		t.Errorf("warning should still name the holder alice: %+v", decision.Conflicts)
+	}
+	if decision.Enforcement != domain.EnforceCooperative {
+		t.Errorf("enforcement = %s, want cooperative", decision.Enforcement)
 	}
 }
 
@@ -394,13 +441,41 @@ func TestSecurityHeadersArePresent(t *testing.T) {
 			t.Errorf("%s = %q, want %q", header, got, want)
 		}
 	}
-	if resp.Header.Get("Content-Security-Policy") == "" {
-		t.Error("no Content-Security-Policy header")
+	csp := resp.Header.Get("Content-Security-Policy")
+	if csp == "" {
+		t.Fatal("no Content-Security-Policy header")
+	}
+	// The dashboard's script and stylesheet are same-origin files under /static/. A policy
+	// that omits 'self' from script-src/style-src forbids them, and the page dies on its
+	// boot placeholder — a header that is present but wrong passes an existence check.
+	for _, directive := range []string{"script-src", "style-src"} {
+		value := directiveValue(csp, directive)
+		if value == "" {
+			t.Errorf("CSP has no %s directive: %q", directive, csp)
+			continue
+		}
+		if !strings.Contains(value, "'self'") {
+			t.Errorf("CSP %s = %q, must allow 'self' or the dashboard cannot load /static/*", directive, value)
+		}
+		if strings.Contains(value, "unsafe-inline") {
+			t.Errorf("CSP %s = %q, the dashboard uses no inline script or style", directive, value)
+		}
 	}
 	// HSTS over plaintext would be useless at best and lock out a local developer at worst.
 	if got := resp.Header.Get("Strict-Transport-Security"); got != "" {
 		t.Errorf("HSTS sent over plaintext: %q", got)
 	}
+}
+
+// directiveValue returns the token list of one CSP directive, or "" when absent.
+func directiveValue(csp, directive string) string {
+	for _, part := range strings.Split(csp, ";") {
+		fields := strings.Fields(part)
+		if len(fields) > 0 && fields[0] == directive {
+			return strings.Join(fields[1:], " ")
+		}
+	}
+	return ""
 }
 
 // ---------------------------------------------------------------------------
