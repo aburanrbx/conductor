@@ -7,6 +7,8 @@
 # conductor runtime state: worktrees, materialized task cards, local session files
 .conductor/runtime/
 .conductor/generated/
+.conductor/snapshots/
+.conductor/attempt.log
 .conductor/.bootstrap-token
 /.claude/worktrees/
 

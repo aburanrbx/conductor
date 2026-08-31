@@ -1,11 +1,12 @@
-import { h, icon } from '../lib/dom.js';
+import { h, icon, replace } from '../lib/dom.js';
 import { defineView, settle } from '../lib/view.js';
 import { card, empty, segmented } from '../components/ui.js';
 import { pill, chip, tierChip, effortChip } from '../components/pill.js';
 import { table } from '../components/table.js';
 import { relTime, fmtDate } from '../lib/format.js';
-import { assignTask, respondToOffer } from '../lib/actions.js';
+import { assignTask, pauseSession, respondToOffer, resumeSession } from '../lib/actions.js';
 import { openModal } from '../components/modal.js';
+import { toast, toastError } from '../components/toast.js';
 
 export default defineView({
   title: 'Sessions',
@@ -54,6 +55,61 @@ export default defineView({
       });
     };
 
+    const manage = s => {
+      const id = encodeURIComponent(s.id);
+      const closed = ['closed', 'stale'].includes(s.state) || s.closed_at;
+      let tab = 'save';
+      let savedPath = null;
+
+      const saveSnapshot = async () => {
+        try {
+          const out = await ctx.api.post(`/v1/sessions/${id}/save`, {});
+          savedPath = out.path;
+          toast(`Snapshot saved for ${s.principal}`, { detail: savedPath });
+        } catch (err) { toastError(err, 'Save failed'); }
+        draw();
+      };
+
+      const saveTab = () => h('div', { class: 'stack' },
+        h('p', { class: 'muted' }, 'Persists a snapshot of this session — its record, its assignments, its capability — under .conductor/snapshots/ in the project\u2019s repository, where it outlives the session itself.'),
+        h('button', { class: 'btn primary', onclick: saveSnapshot }, 'Save snapshot'),
+        savedPath ? h('div', { class: 'hint' }, h('span', { class: 'mono' }, savedPath)) : null);
+
+      const exportTab = () => h('div', { class: 'stack' },
+        h('p', { class: 'muted' }, 'Downloads the same snapshot as JSON in the browser — nothing is written on the server.'),
+        h('button', { class: 'btn primary', onclick: () => downloadSession(ctx, s) }, 'Download JSON'));
+
+      const resumeTab = () => h('div', { class: 'stack' },
+        h('div', { class: 'chips' }, pill(s.state),
+          s.pending_control ? chip('pending ' + s.pending_control, { kind: 'warn', mono: false }) : null),
+        h('p', { class: 'muted' }, closed
+          ? 'This session is closed. A closed session has no sidecar left to pick a resume up — start a new session instead.'
+          : s.pending_control
+            ? `Waiting for the session to pick the ${s.pending_control} up on its next heartbeat.`
+            : s.state === 'paused'
+              ? 'The session is paused. Resume asks its sidecar to continue on its next heartbeat.'
+              : 'Pause asks the session\u2019s sidecar to freeze on its next heartbeat; resume brings it back.'),
+        !closed && !s.pending_control && live(s) ? h('button', {
+          class: 'btn primary',
+          onclick: async () => { if (await (s.state === 'paused' ? resumeSession(ctx, s) : pauseSession(ctx, s))) { modal.close(); refresh(); } },
+        }, s.state === 'paused' ? 'Resume session' : 'Pause session') : null);
+
+      const body = h('div', { class: 'form' });
+      const draw = () => {
+        replace(body,
+          segmented([{ value: 'save', label: 'Save' }, { value: 'export', label: 'Export' }, { value: 'resume', label: 'Resume' }],
+            tab, v => { tab = v; draw(); }),
+          h('div', { style: { marginTop: '14px' } }, tab === 'save' ? saveTab() : tab === 'export' ? exportTab() : resumeTab()));
+      };
+
+      const modal = openModal({
+        title: `Manage — ${s.principal} on ${s.harness}`,
+        body,
+        actions: [{ label: 'Close' }],
+      });
+      draw();
+    };
+
     const tbl = table({
       columns: [
         { key: 'principal', label: 'Who', render: s => h('div', {}, h('strong', {}, s.principal), h('div', { class: 'muted', style: { fontSize: '12px' } }, s.kind === 'human' ? '' : s.kind)) },
@@ -64,11 +120,17 @@ export default defineView({
         { key: 'machine_id', label: 'Machine · branch', render: s => h('div', { class: 'chips' }, s.machine_id ? chip(s.machine_id) : null, s.branch ? chip(s.branch) : null) },
         { key: 'last_heartbeat', label: 'Heartbeat', render: s => relTime(s.last_heartbeat), sort: s => new Date(s.last_heartbeat) },
         { key: 'started_at', label: 'Started', render: s => fmtDate(s.started_at), sort: s => new Date(s.started_at) },
-        { key: 'actions', label: '', sortable: false, render: s => live(s) ? h('div', { class: 'btn-row' },
-          h('button', { class: 'btn sm', onclick: ev => { ev.stopPropagation(); inbox(s); } }, 'Inbox', capOf(s.id).queued_offers ? h('span', { class: 'badge warn' }, capOf(s.id).queued_offers) : null),
-          h('button', { class: 'btn sm', onclick: ev => { ev.stopPropagation(); offer(s); } }, 'Offer task')) : '' },
+        { key: 'actions', label: '', sortable: false, render: s => h('div', { class: 'btn-row' },
+          live(s) ? h('div', { class: 'btn-row' },
+            s.pending_control
+              ? h('button', { class: 'btn sm', disabled: true, title: 'Waiting for the session to pick it up on its next heartbeat' }, s.pending_control === 'pause' ? 'Pausing…' : 'Resuming…')
+              : h('button', { class: 'btn sm', onclick: async ev => { ev.stopPropagation(); if (await (s.state === 'paused' ? resumeSession(ctx, s) : pauseSession(ctx, s))) refresh(); } }, s.state === 'paused' ? 'Resume' : 'Pause'),
+            h('button', { class: 'btn sm', onclick: ev => { ev.stopPropagation(); inbox(s); } }, 'Inbox', capOf(s.id).queued_offers ? h('span', { class: 'badge warn' }, capOf(s.id).queued_offers) : null),
+            h('button', { class: 'btn sm', onclick: ev => { ev.stopPropagation(); offer(s); } }, 'Offer task')) : null,
+          h('button', { class: 'btn sm', onclick: ev => { ev.stopPropagation(); manage(s); } }, 'Manage')) },
       ],
       rows: list, initialSort: { key: 'last_heartbeat', dir: 'desc' },
+      onRow: (s, ev) => { if (ev.target.closest('a, button')) return; manage(s); },
       empty: empty(state.filter === 'live' ? 'No live sessions.' : 'No sessions match.', 'conductor wrap claude --model claude-opus-5 --effort high'),
     });
 
@@ -76,7 +138,7 @@ export default defineView({
       h('div', { class: 'toolbar' },
         segmented([{ value: 'live', label: 'Live' }, { value: 'closed', label: 'Closed' }, { value: 'all', label: 'All' }], state.filter, v => { state.filter = v; refresh(); }),
         h('div', { class: 'spacer' }), h('span', { class: 'muted' }, `${sessions.filter(live).length} live · ${sessions.length} total`)),
-      card({ flush: true, body: tbl, footer: 'A session advertises what it runs; the catalog decides what that is worth. A model the catalog does not know is still usable, just never offered tier-gated work.' }));
+      card({ flush: true, body: tbl, footer: 'A session advertises what it runs; the catalog decides what that is worth. A model the catalog does not know is still usable, just never offered tier-gated work. Pause and resume reach the session through its sidecar, on its next heartbeat.' }));
   },
 });
 
@@ -90,6 +152,26 @@ async function assignTaskDirect(ctx, ref, sessionID) {
     const { toastError } = await import('../components/toast.js');
     toastError(err, 'Offer failed');
     return null;
+  }
+}
+
+// The export tab's download: fetch with the same bearer header every api.js call uses,
+// then hand the blob to a throwaway anchor. The token never rides the query string.
+async function downloadSession(ctx, session) {
+  try {
+    const res = await fetch(`/v1/sessions/${encodeURIComponent(session.id)}/export`, {
+      headers: { Authorization: 'Bearer ' + ctx.api.token, Accept: 'application/json' },
+    });
+    if (!res.ok) throw new Error(`export failed: ${res.status}`);
+    const url = URL.createObjectURL(await res.blob());
+    const a = h('a', { href: url, download: `session-${session.id}.json` });
+    document.body.append(a);
+    a.click();
+    a.remove();
+    URL.revokeObjectURL(url);
+    toast(`Snapshot downloaded for ${session.principal}`);
+  } catch (err) {
+    toastError(err, 'Download failed');
   }
 }
 
