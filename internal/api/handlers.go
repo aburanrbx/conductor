@@ -1,10 +1,13 @@
 package api
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
+	"os"
+	"path/filepath"
 	"time"
 
 	"github.com/adamburan/conductor/internal/config"
@@ -37,6 +40,10 @@ func (s *Server) routes() {
 	m.HandleFunc("GET /v1/projects/{project}/sessions", auth(s.listSessions))
 	m.HandleFunc("POST /v1/sessions/{session}/heartbeat", auth(s.heartbeatSession))
 	m.HandleFunc("POST /v1/sessions/{session}/close", auth(s.closeSession))
+	m.HandleFunc("POST /v1/sessions/{session}/pause", auth(s.pauseSession))
+	m.HandleFunc("POST /v1/sessions/{session}/resume", auth(s.resumeSession))
+	m.HandleFunc("POST /v1/sessions/{session}/save", auth(s.saveSession))
+	m.HandleFunc("GET /v1/sessions/{session}/export", auth(s.exportSession))
 	m.HandleFunc("POST /v1/sessions/{session}/capabilities", auth(s.setSessionCapabilities))
 	m.HandleFunc("GET /v1/sessions/{session}/assignments", auth(s.sessionAssignments))
 	m.HandleFunc("POST /v1/assignments/{assignment}/respond", auth(s.respondToAssignment))
@@ -52,6 +59,7 @@ func (s *Server) routes() {
 	m.HandleFunc("PATCH /v1/tasks/{task}", auth(s.patchTask))
 	m.HandleFunc("GET /v1/tasks/{task}/card", auth(s.getTaskCard))
 	m.HandleFunc("GET /v1/tasks/{task}/attempts", auth(s.listAttempts))
+	m.HandleFunc("GET /v1/tasks/{task}/logs", auth(s.taskLogs))
 	m.HandleFunc("POST /v1/tasks/{task}/claim", auth(s.claimTask))
 	m.HandleFunc("POST /v1/tasks/{task}/release", auth(s.releaseTask))
 	m.HandleFunc("POST /v1/tasks/{task}/transition", auth(s.transitionTask))
@@ -95,6 +103,13 @@ func (s *Server) routes() {
 	s.mcpRoutes(m)
 	s.queueRoutes(m)
 
+	// The mesh surface. /v1/peer/* is authenticated by the peer's mesh certificate (not a
+	// bearer token); /v1/peers is the same link table shown to project members.
+	if s.peerName != "" {
+		m.HandleFunc("GET /v1/peer/info", s.peerAuth(s.peerInfo))
+	}
+	m.HandleFunc("GET /v1/peers", auth(s.listPeers))
+
 	// The SPA owns every path the API does not. Go's mux prefers the more specific pattern,
 	// so /v1/... always wins and everything else — "/", "/tasks/T-42", "/static/app.js" —
 	// is the dashboard's to route client-side.
@@ -132,7 +147,11 @@ func (s *Server) whoami(w http.ResponseWriter, r *http.Request, p domain.Princip
 		role, _ := s.store.RoleIn(r.Context(), pr.ID, p.ID)
 		refs = append(refs, projectRef{ID: pr.ID, Slug: pr.Slug, Role: role})
 	}
-	s.ok(w, r, http.StatusOK, map[string]any{"principal": p, "projects": refs})
+	// endpoint is the address this daemon declares reachable at (--public-url, or derived
+	// from its bind). The dashboard surfaces it in shareable join commands so a teammate
+	// gets the control plane's address, not whatever proxy the current viewer browsed
+	// through.
+	s.ok(w, r, http.StatusOK, map[string]any{"principal": p, "projects": refs, "endpoint": s.self})
 }
 
 func (s *Server) listProjects(w http.ResponseWriter, r *http.Request, p domain.Principal) {
@@ -430,9 +449,10 @@ func validEffort(e domain.Effort) bool {
 }
 
 type heartbeatSessionBody struct {
-	State   domain.SessionState `json:"state"`
-	Branch  string              `json:"branch"`
-	BaseSHA string              `json:"base_sha"`
+	State      domain.SessionState   `json:"state"`
+	Branch     string                `json:"branch"`
+	BaseSHA    string                `json:"base_sha"`
+	ControlAck domain.SessionControl `json:"control_ack"`
 }
 
 func (s *Server) heartbeatSession(w http.ResponseWriter, r *http.Request, p domain.Principal) {
@@ -457,12 +477,15 @@ func (s *Server) heartbeatSession(w http.ResponseWriter, r *http.Request, p doma
 	}
 	updated, err := s.store.HeartbeatSession(r.Context(), db.HeartbeatSessionParams{
 		SessionID: session.ID, State: body.State, Branch: body.Branch, BaseSHA: body.BaseSHA,
-		TTL: project.Config.LeaseTTL.OrDefault(90 * time.Second),
+		ControlAck: body.ControlAck,
+		TTL:        project.Config.LeaseTTL.OrDefault(90 * time.Second),
 	})
 	if err != nil {
 		s.fail(w, r, err)
 		return
 	}
+	// The response is the sidecar's channel to whatever the dashboard has asked of the
+	// session: it carries the pending control the caller should act on and acknowledge.
 	s.ok(w, r, http.StatusOK, updated)
 }
 
@@ -493,6 +516,36 @@ func (s *Server) closeSession(w http.ResponseWriter, r *http.Request, p domain.P
 		return
 	}
 	if err := s.store.CloseSession(r.Context(), session.ID); err != nil {
+		s.fail(w, r, err)
+		return
+	}
+	s.ok(w, r, http.StatusNoContent, nil)
+}
+
+// pauseSession and resumeSession record a lifecycle instruction for the session's sidecar
+// (DESIGN.md §7.3). The dashboard cannot reach into a teammate's terminal; it can only ask
+// the session's own sidecar, which picks the request up on its next heartbeat and
+// acknowledges it. Any project contributor may ask — the same floor that lets a member
+// offer work to a session lets them park one — and the request is idempotent.
+func (s *Server) pauseSession(w http.ResponseWriter, r *http.Request, p domain.Principal) {
+	s.controlSession(w, r, p, domain.ControlPause)
+}
+
+func (s *Server) resumeSession(w http.ResponseWriter, r *http.Request, p domain.Principal) {
+	s.controlSession(w, r, p, domain.ControlResume)
+}
+
+func (s *Server) controlSession(w http.ResponseWriter, r *http.Request, p domain.Principal, control domain.SessionControl) {
+	session, err := s.store.GetSession(r.Context(), r.PathValue("session"))
+	if err != nil {
+		s.fail(w, r, err)
+		return
+	}
+	if _, err := s.svc.Authorize(r.Context(), p, session.ProjectID, domain.RoleContributor); err != nil {
+		s.fail(w, r, err)
+		return
+	}
+	if _, err := s.store.RequestSessionControl(r.Context(), session.ID, control); err != nil {
 		s.fail(w, r, err)
 		return
 	}
@@ -1482,6 +1535,176 @@ func (s *Server) streamEvents(w http.ResponseWriter, r *http.Request, p domain.P
 			}
 		}
 	}
+}
+
+// logTailBytes caps the history a log stream opens with, so a long-running attempt does not
+// dump its whole past on connect.
+const logTailBytes = 256 << 10
+
+// logReadMax bounds one poll's read, so a fast-growing file cannot make one frame huge.
+const logReadMax = 256 << 10
+
+// taskLogs streams the current attempt's log over SSE: existing content first, then
+// appends as the harness writes them, then a final done frame once the attempt is
+// terminal.
+//
+// The log is the harness subprocess's combined output, mirrored by the pump into the
+// attempt's worktree (.conductor/attempt.log). It is readable where the control plane
+// shares a machine with the runner (DESIGN.md §28.1); elsewhere the stream says no log
+// is available and closes when the attempt ends. The file lives and dies with the
+// worktree — removed on success, kept with the tree on failure (§27.2) — which is its
+// retention policy.
+func (s *Server) taskLogs(w http.ResponseWriter, r *http.Request, p domain.Principal) {
+	task, _, err := s.taskFor(r, p, domain.RoleObserver)
+	if err != nil {
+		s.fail(w, r, err)
+		return
+	}
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		s.fail(w, r, errors.New("streaming unsupported"))
+		return
+	}
+
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("Connection", "keep-alive")
+	w.Header().Set("X-Accel-Buffering", "no")
+	w.WriteHeader(http.StatusOK)
+	flusher.Flush()
+
+	send := func(payload any) {
+		body, err := json.Marshal(payload)
+		if err != nil {
+			return
+		}
+		_, _ = fmt.Fprintf(w, "data: %s\n\n", body)
+		flusher.Flush()
+	}
+
+	ticker := time.NewTicker(time.Second)
+	defer ticker.Stop()
+	keepalive := time.NewTicker(20 * time.Second)
+	defer keepalive.Stop()
+
+	// The attempt is resolved once and then followed by id, so a stream opened while an
+	// attempt runs keeps following it through its terminal transition rather than
+	// silently jumping to whichever attempt is live next.
+	var (
+		attemptID domain.ID
+		offset    int64
+		waiting   string // last waiting reason sent; "" once frames are flowing
+	)
+	setWaiting := func(reason string) {
+		if waiting != reason {
+			waiting = reason
+			send(map[string]any{"type": "waiting", "reason": reason})
+		}
+	}
+	sendDone := func(state string) {
+		send(map[string]any{"type": "done", "state": state})
+	}
+
+	for {
+		select {
+		case <-r.Context().Done():
+			return
+
+		case <-keepalive.C:
+			// Comment frames keep intermediaries from closing an idle connection.
+			_, _ = fmt.Fprint(w, ": keepalive\n\n")
+			flusher.Flush()
+
+		case <-ticker.C:
+			var attempt domain.Attempt
+			switch {
+			case attemptID != "":
+				a, err := s.store.GetAttempt(r.Context(), attemptID)
+				if err != nil {
+					return
+				}
+				attempt = a
+			default:
+				// Prefer the live write attempt; fall back to the most recent one, so
+				// a stream opened after the run still plays the log back.
+				a, err := s.store.ActiveAttempt(r.Context(), task.ID)
+				if err != nil {
+					list, lerr := s.store.ListAttempts(r.Context(), task.ID)
+					if lerr != nil || len(list) == 0 {
+						if fresh, terr := s.store.GetTask(r.Context(), task.ID); terr == nil && fresh.Status.IsTerminal() {
+							sendDone(string(fresh.Status))
+							return
+						}
+						setWaiting("no attempt yet")
+						continue
+					}
+					a = list[len(list)-1]
+				}
+				attempt, attemptID = a, a.ID
+			}
+
+			if attempt.WorktreePath == "" {
+				if attempt.State.IsTerminal() {
+					sendDone(string(attempt.State))
+					return
+				}
+				setWaiting("attempt is " + string(attempt.State) + "; no workspace yet")
+				continue
+			}
+
+			info, err := os.Stat(attemptLogPath(attempt))
+			if err != nil {
+				if attempt.State.IsTerminal() {
+					sendDone(string(attempt.State))
+					return
+				}
+				setWaiting("no log yet")
+				continue
+			}
+			waiting = ""
+			if info.Size() < offset {
+				// Truncated or rotated: start over rather than miss the new run.
+				offset = 0
+			}
+			if info.Size() > offset {
+				if offset == 0 && info.Size() > logTailBytes {
+					offset = info.Size() - logTailBytes
+					send(map[string]any{"type": "log", "text": "… earlier output truncated …\n"})
+				}
+				remaining := info.Size() - offset
+				if remaining > logReadMax {
+					remaining = logReadMax
+				}
+				buf := make([]byte, remaining)
+				n, _ := attemptLogReadAt(attempt, buf, offset)
+				// Only whole lines are sent: a chunk ending mid-rune would be corrupted
+				// by the JSON encoding.
+				if i := bytes.LastIndexByte(buf[:n], '\n'); i >= 0 {
+					send(map[string]any{"type": "log", "text": string(buf[:i+1])})
+					offset += int64(i) + 1
+				}
+			}
+			if attempt.State.IsTerminal() {
+				sendDone(string(attempt.State))
+				return
+			}
+		}
+	}
+}
+
+// attemptLogPath is where the harness pump writes an attempt's combined output,
+// inside the worktree the attempt runs in.
+func attemptLogPath(a domain.Attempt) string {
+	return filepath.Join(a.WorktreePath, ".conductor", "attempt.log")
+}
+
+func attemptLogReadAt(a domain.Attempt, buf []byte, offset int64) (int, error) {
+	f, err := os.Open(attemptLogPath(a))
+	if err != nil {
+		return 0, err
+	}
+	defer f.Close()
+	return f.ReadAt(buf, offset)
 }
 
 // ---------------------------------------------------------------------------
