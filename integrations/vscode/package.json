@@ -1,9 +1,9 @@
 {
   "name": "conductor-sessions",
-  "displayName": "Conductor Agent Sessions",
-  "description": "Pause and resume the coding-agent sessions running in your terminals, from VS Code. Companion to the `conductor` CLI: reopens paused Claude Code, Codex, and OpenCode sessions in integrated terminals.",
+  "displayName": "Conductor",
+  "description": "Conductor in VS Code: who is live, what is in flight, and check-before-edit — companion to the conductor CLI. Also reopens paused Claude Code, Codex, and OpenCode sessions in integrated terminals.",
   "publisher": "conductor",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "engines": {
     "vscode": "^1.85.0"
   },
@@ -12,10 +12,61 @@
   ],
   "main": "./extension.js",
   "activationEvents": [
+    "onStartupFinished",
     "onUri"
   ],
   "contributes": {
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "conductor",
+          "title": "Conductor",
+          "icon": "media/conductor.svg"
+        }
+      ]
+    },
+    "views": {
+      "conductor": [
+        {
+          "id": "conductor.inFlight",
+          "name": "In Flight"
+        }
+      ]
+    },
     "commands": [
+      {
+        "command": "conductor.refresh",
+        "title": "Conductor: Refresh",
+        "icon": "$(refresh)"
+      },
+      {
+        "command": "conductor.check",
+        "title": "Conductor: Check Before Editing…"
+      },
+      {
+        "command": "conductor.taskCreate",
+        "title": "Conductor: Create Task…"
+      },
+      {
+        "command": "conductor.taskClaimNext",
+        "title": "Conductor: Claim Next Task"
+      },
+      {
+        "command": "conductor.taskShow",
+        "title": "Conductor: Show Task Card…"
+      },
+      {
+        "command": "conductor.taskRelease",
+        "title": "Conductor: Release Task…"
+      },
+      {
+        "command": "conductor.wrap",
+        "title": "Conductor: Start Wrapped Agent Session…"
+      },
+      {
+        "command": "conductor.dashboard",
+        "title": "Conductor: Open Dashboard"
+      },
       {
         "command": "conductor.pauseAll",
         "title": "Conductor: Pause All Agent Sessions"
@@ -23,8 +74,28 @@
       {
         "command": "conductor.resumeAll",
         "title": "Conductor: Resume All Agent Sessions"
+      },
+      {
+        "command": "conductor.menu",
+        "title": "Conductor: Menu",
+        "icon": "$(pulse)"
       }
     ],
+    "menus": {
+      "commandPalette": [
+        {
+          "command": "conductor.menu",
+          "when": "false"
+        }
+      ],
+      "view/title": [
+        {
+          "command": "conductor.refresh",
+          "when": "view == conductor.inFlight",
+          "group": "navigation"
+        }
+      ]
+    },
     "configuration": {
       "title": "Conductor",
       "properties": {
@@ -37,6 +108,12 @@
           "type": "string",
           "default": "",
           "description": "Conductor state directory (the CLI's CONDUCTOR_STATE_DIR). Leave empty for the default, ~/.conductor."
+        },
+        "conductor.refreshIntervalSeconds": {
+          "type": "number",
+          "default": 30,
+          "minimum": 0,
+          "description": "Seconds between automatic refreshes of in-flight status. 0 disables polling."
         }
       }
     }
